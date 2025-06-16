@@ -255,6 +255,39 @@ def check_ssl_tls_basic(target_url: str):
         console.print(error_text)
 
 
+# --- Task dispatch mapping for HTTP checks ---
+TASK_MAPPING = {
+    "common_paths": check_sensitive_paths_scan,
+    "robots.txt": check_robots_txt,
+    "xss": check_reflected_xss,
+    "open_redirect": check_open_redirect,
+    "cors_misconfiguration": check_cors_misconfiguration,
+    # Note: check_security_headers_and_disclosure and check_ssl_tls_basic are called directly
+    # outside the queue for initial response processing.
+}
+
+def http_worker(task_queue: Queue):
+    """Worker that processes HTTP-based tasks from the queue."""
+    while True:
+        task = task_queue.get()
+        if task is None:
+            # Sentinel received, exit loop
+            task_queue.task_done()
+            break
+
+        task_name, args, kwargs = task
+        func = TASK_MAPPING.get(task_name)
+        if func:
+            try:
+                func(*args, **kwargs)
+            except Exception as e:
+                console.print(f"[red][!] Error in '{task_name}' check: {escape(str(e))}[/red]")
+        else:
+            console.print(f"[yellow][!] No handler for task '{task_name}'[/yellow]")
+
+        task_queue.task_done()
+
+
 def passive_subdomain_discovery(domain: str):
     """Performs passive subdomain discovery using crt.sh certificate transparency logs."""
     console.print(f"\n[cyan][+] Performing passive subdomain discovery for {domain}...[/cyan]")
@@ -371,12 +404,14 @@ def scan_command(
     console.print(f"\n[cyan][+] Starting concurrent HTTP-based vulnerability checks (Threads: {threads})...[/cyan]")
     http_workers = []
     for _ in range(threads):
-        worker = threading.Thread(target=http_worker, args=(http_check_queue,))
-        worker.daemon = True
-        worker.start()
-        http_workers.append(worker)
+        # Changed target to http_worker (was implicitly using http_worker from old context)
+        t = threading.Thread(target=http_worker, args=(http_check_queue,))
+        t.daemon = True
+        t.start()
+        http_workers.append(t)
 
-    # Populate HTTP check queue with tasks
+    # Enqueue named tasks with (task_name, args_tuple, kwargs_dict)
+    # These tasks will be picked up by the http_worker threads
     http_check_queue.put(("common_paths", (target_url,), {}))
     http_check_queue.put(("robots.txt", (target_url,), {}))
     http_check_queue.put(("xss", (target_url,), {}))
@@ -385,8 +420,9 @@ def scan_command(
     
     # Wait for all HTTP checks to complete
     http_check_queue.join()
+    # Send sentinel values to terminate worker threads
     for _ in range(threads):
-        http_check_queue.put(None) # Sentinel to terminate workers
+        http_check_queue.put(None)
     for worker in http_workers:
         worker.join()
 
@@ -459,4 +495,3 @@ if __name__ == "__main__":
         error_message = Text(escape(str(e)), style="red")
         console.print(error_message)
         sys.exit(1)
-        
