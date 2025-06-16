@@ -50,7 +50,11 @@ COMMON_PORTS = [21, 22, 23, 25, 53, 80, 110, 139, 143, 443, 445, 3306, 8080, 844
 COMMON_PATHS = [
     '/admin/', '/login.php', '/wp-admin/', '/config.php', '/.env',
     '/phpinfo.php', '/test.php', '/backup.zip', '/sitemap.xml', '/robots.txt',
-    '/.git/config', '/.svn/entries', '/etc/passwd', '/proc/self/cmdline' # Add common Linux path traversal attempts
+    '/.git/config', '/.svn/entries', '/etc/passwd', '/proc/self/cmdline',
+    # More common backup/sensitive extensions
+    '/web.config.bak', '/.htaccess.bak', '/wp-config.php.bak', '/database.sql',
+    '/database.sql.zip', '/site.tar.gz', '/backup.tar.gz', '/temp.zip',
+    '/README.md.bak', '/readme.txt', '/install.php', '/config.inc.php.bak'
 ]
 
 # --- Vulnerability Check Definitions (Extensible "Templates") ---
@@ -66,34 +70,41 @@ VULNERABILITY_CHECKS = [
 
     # Information Disclosure & Misconfigurations
     {"type": "server_info_disclosure", "severity": "Low", "description": "Server header discloses detailed server software and version, aiding attackers.", "remediation": "Configure web server to suppress or generalize the 'Server' header information."},
+    {"type": "x_powered_by_disclosure", "severity": "Low", "description": "X-Powered-By or Via header discloses underlying technologies/proxies, aiding attackers.", "remediation": "Configure web server/application to suppress or generalize 'X-Powered-By' and 'Via' headers."},
     {"type": "directory_listing_enabled", "severity": "Medium", "description": "Directory listing is enabled, potentially exposing sensitive files.", "remediation": "Disable directory listing on the web server (e.g., Options -Indexes in Apache, autoindex off in Nginx)."},
-    {"type": "sensitive_file_exposure", "severity": "High", "description": "Sensitive configuration or info file (e.g., .git, phpinfo.php, .env) is exposed.", "remediation": "Remove or properly restrict access to sensitive files and directories."},
+    {"type": "sensitive_file_exposure", "severity": "High", "description": "Sensitive configuration or info file (e.g., .git, phpinfo.php, .env, backup files) is exposed.", "remediation": "Remove or properly restrict access to sensitive files and directories."},
     {"type": "robots_txt_disallowed_paths", "severity": "Low", "description": "Robots.txt lists disallowed paths, potentially indicating sensitive directories.", "remediation": "Review sensitive disallowed paths. Ensure they are properly secured and not publicly accessible. Use robots.txt for crawl control, not security."},
     {"type": "insecure_ssl_tls", "severity": "Medium", "description": "Target uses HTTP instead of HTTPS, or has basic SSL/TLS issues (e.g., invalid cert).", "remediation": "Force HTTPS. Ensure valid, up-to-date SSL/TLS certificates are installed and configured correctly."},
     {"type": "cors_misconfiguration", "severity": "Medium", "description": "Cross-Origin Resource Sharing (CORS) is overly permissive, potentially allowing unauthorized cross-domain requests.", "remediation": "Strictly whitelist allowed origins for CORS. Avoid `Access-Control-Allow-Origin: *` in production unless absolutely necessary."},
+    {"type": "insecure_cors_preflight", "severity": "Medium", "description": "CORS preflight (OPTIONS method) indicates overly permissive access to HTTP methods or headers.", "remediation": "Limit `Access-Control-Allow-Methods` and `Access-Control-Allow-Headers` to only what is necessary and safe."},
+    {"type": "http_method_allowed_misconfig", "severity": "Medium", "description": "Unsafe HTTP methods (e.g., PUT, DELETE, OPTIONS) are allowed, potentially enabling unauthorized file operations or information disclosure.", "remediation": "Disable all unnecessary HTTP methods on the web server/application. Only allow methods required for functionality (e.g., GET, POST)."},
 
     # Web Application Vulnerabilities
     {"type": "reflected_xss_potential", "severity": "High", "description": "Potential reflected XSS detected. Input from URL parameter is echoed without proper sanitization.", "remediation": "Implement rigorous input validation and output encoding for all user-supplied data. Consider a strong CSP."},
     {"type": "open_redirect_potential", "severity": "Medium", "description": "Potential open redirect vulnerability. User input can redirect to arbitrary URLs.", "remediation": "Validate and whitelist all redirection targets. Avoid using untrusted input in redirection logic. Use safe redirect mechanisms."},
+    {"type": "cookie_missing_httponly", "severity": "Medium", "description": "Cookie missing HttpOnly flag, making it vulnerable to XSS attacks (session hijacking).", "remediation": "Set the HttpOnly flag on all session and sensitive cookies to prevent client-side script access."},
+    {"type": "cookie_missing_secure", "severity": "Medium", "description": "Cookie missing Secure flag on an HTTPS site, potentially exposing it over HTTP.", "remediation": "Set the Secure flag on all cookies to ensure they are only sent over HTTPS connections."},
+    {"type": "cookie_missing_samesite", "severity": "Low", "description": "Cookie missing SameSite flag or set to None without Secure, making it vulnerable to CSRF.", "remediation": "Implement SameSite=Lax or SameSite=Strict for all cookies. If SameSite=None is necessary, ensure Secure flag is also set."},
 ]
 
 
 # --- Helper Functions ---
 
-def fetch_url(url: str, timeout: int = 7, allow_redirects: bool = False) -> Optional[requests.Response]:
-    """Helper to fetch a URL and return response or None on error."""
+def fetch_url(url: str, method: str = 'GET', headers: Optional[dict] = None, timeout: int = 7, allow_redirects: bool = False) -> Optional[requests.Response]:
+    """Helper to fetch a URL with specified method and headers, returns response or None on error."""
+    if headers is None:
+        headers = {}
     try:
-        response = requests.get(url, timeout=timeout, allow_redirects=allow_redirects)
+        response = requests.request(method, url, headers=headers, timeout=timeout, allow_redirects=allow_redirects)
         response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
         return response
     except requests.exceptions.RequestException as e:
-        # Use Text object for error message
-        error_text = Text(f"[!] Network error fetching {url}: ", style="red")
+        error_text = Text(f"[!] Network error ({method}) fetching {url}: ", style="red")
         error_text.append(escape(str(e)), style="red dim")
         console.print(error_text)
         return None
     except Exception as e:
-        error_text = Text(f"[!] An unexpected error occurred while fetching {url}: ", style="red")
+        error_text = Text(f"[!] An unexpected error occurred ({method}) while fetching {url}: ", style="red")
         error_text.append(escape(str(e)), style="red dim")
         console.print(error_text)
         return None
@@ -152,23 +163,72 @@ def check_security_headers_and_disclosure(target_url: str, response: requests.Re
                     f"Server header discloses detailed server software and version: {server}",
                     "Configure web server to suppress or generalize the 'Server' header information.")
 
+    # X-Powered-By/Via Header Disclosure
+    x_powered_by = headers.get("x-powered-by", "")
+    via = headers.get("via", "")
+    if x_powered_by or via:
+        disclosure_info = []
+        if x_powered_by:
+            disclosure_info.append(f"X-Powered-By: {x_powered_by}")
+        if via:
+            disclosure_info.append(f"Via: {via}")
+        add_finding("x_powered_by_disclosure", "Low", target_url,
+                    f"Technology disclosure via headers: {', '.join(disclosure_info)}",
+                    "Configure web server/application to suppress or generalize 'X-Powered-By' and 'Via' headers.")
+
     # Directory Listing (root)
     if "Index of /" in response.text and response.status_code == 200:
         add_finding("directory_listing_enabled", "Medium", target_url,
                     "Directory listing is enabled on the root, potentially exposing sensitive files.",
                     "Disable directory listing on the web server (e.g., Options -Indexes in Apache, autoindex off in Nginx).")
 
+
+def check_cookie_security_flags(target_url: str, response: requests.Response):
+    """Checks for missing HttpOnly, Secure, and SameSite flags on cookies."""
+    cookies = response.cookies
+    is_https = target_url.startswith("https://")
+
+    for cookie_name, cookie_value in cookies.items():
+        cookie_attrs = cookies.get_dict(cookie_name) # This gets the attributes for the cookie
+        
+        # Check HttpOnly
+        if 'httponly' not in cookie_attrs or not cookies[cookie_name].get('httponly'):
+            add_finding("cookie_missing_httponly", "Medium", target_url,
+                        f"Cookie '{cookie_name}' missing HttpOnly flag.",
+                        "Set the HttpOnly flag on all session and sensitive cookies to prevent client-side script access.")
+
+        # Check Secure
+        if is_https and ('secure' not in cookie_attrs or not cookies[cookie_name].get('secure')):
+            add_finding("cookie_missing_secure", "Medium", target_url,
+                        f"Cookie '{cookie_name}' missing Secure flag on HTTPS connection.",
+                        "Set the Secure flag on all cookies to ensure they are only sent over HTTPS connections.")
+        
+        # Check SameSite
+        samesite_value = cookies[cookie_name].get('samesite')
+        if samesite_value is None:
+            add_finding("cookie_missing_samesite", "Low", target_url,
+                        f"Cookie '{cookie_name}' missing SameSite flag.",
+                        "Implement SameSite=Lax or SameSite=Strict for all cookies. If SameSite=None is necessary, ensure Secure flag is also set.")
+        elif samesite_value.lower() == 'none' and not cookies[cookie_name].get('secure'):
+            add_finding("cookie_missing_samesite", "Medium", target_url,
+                        f"Cookie '{cookie_name}' has SameSite=None but is missing Secure flag.",
+                        "If SameSite=None is used, the Secure flag MUST also be set to protect against cross-site attacks.")
+
+
 def check_sensitive_paths_scan(base_url: str):
-    """Scans for commonly exposed sensitive paths."""
+    """Scans for commonly exposed sensitive paths and backup files."""
     for path in COMMON_PATHS:
         full_url = base_url.rstrip("/") + path
         response = fetch_url(full_url)
         if response and response.status_code == 200:
             description = f"Path '{path}' found."
             if "Index of" in response.text:
-                description = f"Exposed directory '{path}' found."
-            add_finding("sensitive_file_exposure", "High", full_url, description,
-                        "Remove or properly restrict access to sensitive files and directories.")
+                description = f"Exposed directory listing found at '{path}'."
+                add_finding("directory_listing_enabled", "Medium", full_url, description,
+                            "Disable directory listing on the web server (e.g., Options -Indexes in Apache, autoindex off in Nginx).")
+            else:
+                add_finding("sensitive_file_exposure", "High", full_url, description,
+                            "Remove or properly restrict access to sensitive files and directories.")
 
 def check_robots_txt(base_url: str):
     """Fetches and parses robots.txt for disallowed paths."""
@@ -213,24 +273,60 @@ def check_open_redirect(base_url: str):
 
 def check_cors_misconfiguration(base_url: str):
     """Checks for overly permissive CORS headers."""
-    # Attempt to trigger CORS check from an arbitrary origin
+    # Attempt to trigger CORS check from an arbitrary origin (direct GET)
     headers = {"Origin": "http://malicious.com"}
-    try:
-        response = requests.get(base_url, headers=headers, timeout=5)
-        if response and response.headers.get("Access-Control-Allow-Origin") == "*":
-            add_finding("cors_misconfiguration", "Medium", base_url,
-                        "CORS header `Access-Control-Allow-Origin: *` found. Allows all origins.",
-                        "Strictly whitelist allowed origins for CORS. Avoid `Access-Control-Allow-Origin: *` in production unless absolutely necessary.")
-        elif response and response.headers.get("Access-Control-Allow-Origin") == "http://malicious.com":
-             add_finding("cors_misconfiguration", "Medium", base_url,
-                        "CORS header `Access-Control-Allow-Origin` reflects origin. Potentially vulnerable if combined with other issues.",
-                        "Ensure `Access-Control-Allow-Origin` only allows trusted domains. Avoid reflecting user-supplied origins.")
-    except requests.exceptions.RequestException as e:
-        # Ignore network errors for CORS check
-        error_text = Text(f"[!] Could not perform CORS check on {base_url}: ", style="dim red")
-        error_text.append(escape(str(e)), style="dim red")
-        console.print(error_text)
+    response_get = fetch_url(base_url, headers=headers)
+    if response_get and response_get.headers.get("Access-Control-Allow-Origin") == "*":
+        add_finding("cors_misconfiguration", "Medium", base_url,
+                    "CORS header `Access-Control-Allow-Origin: *` found. Allows all origins.",
+                    "Strictly whitelist allowed origins for CORS. Avoid `Access-Control-Allow-Origin: *` in production unless absolutely necessary.")
+    elif response_get and response_get.headers.get("Access-Control-Allow-Origin") == "http://malicious.com":
+         add_finding("cors_misconfiguration", "Medium", base_url,
+                    "CORS header `Access-Control-Allow-Origin` reflects origin. Potentially vulnerable if combined with other issues.",
+                    "Ensure `Access-Control-Allow-Origin` only allows trusted domains. Avoid reflecting user-supplied origins.")
 
+def check_cors_preflight(base_url: str):
+    """Performs a CORS preflight (OPTIONS) check for allowed methods and headers."""
+    headers = {
+        "Origin": "http://malicious.com",
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "X-Custom-Header, Content-Type"
+    }
+    response_options = fetch_url(base_url, method='OPTIONS', headers=headers)
+    if response_options:
+        allow_origin = response_options.headers.get("Access-Control-Allow-Origin")
+        allow_methods = response_options.headers.get("Access-Control-Allow-Methods")
+        allow_headers = response_options.headers.get("Access-Control-Allow-Headers")
+
+        if allow_origin == "*":
+            add_finding("insecure_cors_preflight", "Medium", base_url,
+                        "CORS preflight allows all origins (`Access-Control-Allow-Origin: *`) for OPTIONS requests.",
+                        "Review CORS configuration to restrict allowed origins for preflight requests.")
+        
+        if allow_methods and ("PUT" in allow_methods.upper() or "DELETE" in allow_methods.upper()):
+             add_finding("insecure_cors_preflight", "Low", base_url,
+                        f"CORS preflight allows potentially unsafe methods: {allow_methods}",
+                        "Limit `Access-Control-Allow-Methods` to only necessary HTTP verbs in CORS preflight responses.")
+        
+        # Add more granular checks if needed for specific headers or patterns
+
+def check_http_method_discovery(target_url: str):
+    """Discovers allowed HTTP methods using OPTIONS request."""
+    response = fetch_url(target_url, method='OPTIONS')
+    if response and 'Allow' in response.headers:
+        allowed_methods = response.headers['Allow'].upper().split(',')
+        allowed_methods = [m.strip() for m in allowed_methods]
+        
+        unsafe_methods = [m for m in allowed_methods if m in ["PUT", "DELETE", "CONNECT", "TRACE", "PATCH"]]
+        
+        if unsafe_methods:
+            add_finding("http_method_allowed_misconfig", "Medium", target_url,
+                        f"Unsafe HTTP methods explicitly allowed: {', '.join(unsafe_methods)}",
+                        "Disable all unnecessary HTTP methods on the web server/application. Only allow methods required for functionality (e.g., GET, POST).")
+        # else:
+        #    console.print(f"[dim][+] Allowed HTTP Methods for {target_url}: {', '.join(allowed_methods)}[/dim]")
+    # else:
+    #    console.print(f"[dim][!] Could not determine allowed HTTP methods for {target_url}.[/dim]")
 
 def check_ssl_tls_basic(target_url: str):
     """Basic SSL/TLS check: verifies if HTTPS is used and if certificate is valid."""
@@ -257,13 +353,13 @@ def check_ssl_tls_basic(target_url: str):
 
 # --- Task dispatch mapping for HTTP checks ---
 TASK_MAPPING = {
-    "common_paths": check_sensitive_paths_scan,
+    "sensitive_paths": check_sensitive_paths_scan, # Renamed for clarity
     "robots.txt": check_robots_txt,
     "xss": check_reflected_xss,
     "open_redirect": check_open_redirect,
-    "cors_misconfiguration": check_cors_misconfiguration,
-    # Note: check_security_headers_and_disclosure and check_ssl_tls_basic are called directly
-    # outside the queue for initial response processing.
+    "cors_misconfiguration_direct": check_cors_misconfiguration, # Original CORS via GET
+    "cors_preflight": check_cors_preflight, # New CORS via OPTIONS
+    "http_methods": check_http_method_discovery, # New HTTP method discovery
 }
 
 def http_worker(task_queue: Queue):
@@ -281,7 +377,10 @@ def http_worker(task_queue: Queue):
             try:
                 func(*args, **kwargs)
             except Exception as e:
-                console.print(f"[red][!] Error in '{task_name}' check: {escape(str(e))}[/red]")
+                # Use Text object for error message in worker
+                error_text = Text(f"[red][!] Error in '{task_name}' check: ", style="red")
+                error_text.append(escape(str(e)), style="red dim")
+                console.print(error_text)
         else:
             console.print(f"[yellow][!] No handler for task '{task_name}'[/yellow]")
 
@@ -395,6 +494,7 @@ def scan_command(
         console.print(f"[green][+] HTTP Status: {initial_response.status_code}[/green]")
         check_security_headers_and_disclosure(target_url, initial_response)
         check_ssl_tls_basic(target_url) # Check SSL/TLS only if HTTPS is used or fetchable
+        check_cookie_security_flags(target_url, initial_response) # New: Check cookie flags
     else:
         console.print(f"[red][!] Could not get initial HTTP response from {target_url}. Skipping most web checks.[/red]")
         # If we can't even connect to the initial URL, many web checks will fail.
@@ -412,11 +512,13 @@ def scan_command(
 
     # Enqueue named tasks with (task_name, args_tuple, kwargs_dict)
     # These tasks will be picked up by the http_worker threads
-    http_check_queue.put(("common_paths", (target_url,), {}))
+    http_check_queue.put(("sensitive_paths", (target_url,), {})) # Changed key for clarity
     http_check_queue.put(("robots.txt", (target_url,), {}))
     http_check_queue.put(("xss", (target_url,), {}))
     http_check_queue.put(("open_redirect", (target_url,), {}))
-    http_check_queue.put(("cors_misconfiguration", (target_url,), {}))
+    http_check_queue.put(("cors_misconfiguration_direct", (target_url,), {})) # Original CORS
+    http_check_queue.put(("cors_preflight", (target_url,), {})) # New CORS preflight
+    http_check_queue.put(("http_methods", (target_url,), {})) # New HTTP methods
     
     # Wait for all HTTP checks to complete
     http_check_queue.join()
