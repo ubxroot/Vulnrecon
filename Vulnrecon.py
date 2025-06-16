@@ -41,6 +41,8 @@ MAIN_BANNER.append("github.com/ubxroot | Scripted in Python3\n", style="bright_b
 # --- Global Data Structures ---
 all_findings = []
 http_check_queue = Queue()
+# Ensure port_scan_results is initialized globally if used to collect results directly
+port_scan_results = []
 findings_lock = threading.Lock() # Lock for thread-safe access to all_findings
 
 # --- Configuration for Common Scans ---
