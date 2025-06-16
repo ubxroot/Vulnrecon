@@ -56,28 +56,34 @@ pip install -r requirements.txt
 ## 💡 Basic Usage
 
 * Run full scan against target
+```
 python vulnrecon.py scan example.com
-
+```
 * Scan with 10 concurrent threads
+```
 python vulnrecon.py scan https://example.com --threads 10
-
+```
 * Perform port scan only
+```
 python vulnrecon.py port-scan 192.168.1.1
-
+```
 
 ---
 
 ## 🧰 Advanced Features
 
 * Subdomain discovery mode
+```
 python vulnrecon.py subdomains example.com
-
+```
 * Custom port range scanning
+```
 python vulnrecon.py port-scan 192.168.1.1 --ports 21-443
-
+```
 * Save results to JSON
+```
 python vulnrecon.py scan example.com --output results.json
-
+```
 
 ---
 
